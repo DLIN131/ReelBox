@@ -58,19 +58,21 @@ function createWindow() {
   })
 }
 
-/** 縮圖、預覽、影片都補上網站的 Referer（部分 CDN 沒有 Referer 會擋） */
+/** 縮圖、預覽、影片都補上所屬網站的 Referer（部分 CDN 沒有 Referer 會擋） */
 function setupHeaders() {
   session.defaultSession.webRequest.onBeforeSendHeaders({ urls: ['https://*/*', 'http://*/*'] }, (details, cb) => {
-    if (fetcher.isSiteUrl(details.url) || details.resourceType === 'media') details.requestHeaders.Referer = fetcher.base() + '/'
+    const site = fetcher.siteForUrl(details.url)
+    if (site) details.requestHeaders.Referer = fetcher.base(site) + '/'
     cb({ requestHeaders: details.requestHeaders })
   })
 }
 
 function setupIpc() {
-  ipcMain.handle('net:get', (_e, url) => fetcher.get(url))
-  ipcMain.handle('net:sources', (_e, url) => fetcher.sources(url))
+  ipcMain.handle('net:get', (_e, site, url) => fetcher.get(site, url))
+  ipcMain.handle('net:sources', (_e, site, url) => fetcher.sources(site, url))
+  ipcMain.handle('net:sizes', (_e, site, urls) => fetcher.sizes(site, urls))
   ipcMain.handle('site:config', () => fetcher.config())
-  ipcMain.handle('site:setBase', (_e, b) => fetcher.setBase(b))
+  ipcMain.handle('site:setBase', (_e, site, b) => fetcher.setBase(site, b))
   ipcMain.handle('shell:external', (_e, url) => shell.openExternal(url))
 }
 

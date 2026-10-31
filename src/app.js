@@ -1,5 +1,5 @@
 import { store } from './store.js'
-import * as site from './site.js'
+import { SITES, SITE_KEYS, siteOf } from './sites/index.js'
 
 const $ = (s, r = document) => r.querySelector(s)
 const view = $('#view')
@@ -56,14 +56,71 @@ const zhAgo = (s) =>
     .replace(/(\d+)\s*(second|minute|hour|day|week|month|year)s?\s*ago/i, (_m, n, u) => `${n} ${{ second: '秒', minute: '分鐘', hour: '小時', day: '天', week: '週', month: '個月', year: '年' }[u.toLowerCase()]}前`)
     .replace(/^Submitted:\s*/i, '')
 
+// ---------- 來源 ----------
+
+// 站名、網址都由主程序提供（原始碼裡只有 Base64）
+const siteCfg = await window.hub.config()
+const siteLabel = (k) => siteCfg[k]?.label || k
+let curSite = SITE_KEYS.includes(store.get('site')) ? store.get('site') : SITE_KEYS[0]
+const siteBadge = (k) => h('span', { class: `site-badge ${k}` }, siteLabel(k))
+
+function setSite(k, { go = true } = {}) {
+  if (!SITES[k]) return
+  curSite = k
+  store.set('site', k)
+  renderSiteSwitch()
+  renderTabs()
+  if (go) {
+    if (!player.classList.contains('hidden')) closeVideo()
+    backStack.length = 0
+    nav('home', {}, { push: false })
+  }
+}
+
+function renderSiteSwitch() {
+  $('#siteSwitch').replaceChildren(...SITE_KEYS.map((k) => h('button', { class: k === curSite ? 'on' : '', title: `切換到 ${siteLabel(k)}`, onclick: () => k !== curSite && setSite(k) }, siteLabel(k))))
+}
+
+/** 上方分頁：首頁、該來源的分類類分頁、收藏、紀錄、下載、設定 */
+function renderTabs() {
+  const tabs = [['home', '首頁'], ...siteOf(curSite).groupTabs.map((g) => [`group:${g.kind}`, g.name]), ['favorites', '收藏'], ['history', '紀錄'], ['downloads', '下載'], ['settings', '設定']]
+  $('#tabs').replaceChildren(
+    ...tabs.map(([id, name]) =>
+      h(
+        'button',
+        {
+          'data-nav': id,
+          onclick: () => {
+            if (!player.classList.contains('hidden')) closeVideo()
+            if (id.startsWith('group:')) nav('groups', { kind: id.slice(6) })
+            else nav(id)
+          },
+        },
+        name,
+        id === 'downloads' ? h('span', { id: 'dlCount', class: 'dl-count hidden' }) : null,
+      ),
+    ),
+  )
+  markTab()
+  updateDlCount()
+}
+
+function markTab() {
+  const id = current.name === 'groups' ? `group:${current.params.kind}` : current.name
+  for (const b of document.querySelectorAll('#tabs button')) b.classList.toggle('active', b.dataset.nav === id)
+}
+
 // ---------- 收藏 / 紀錄 ----------
 
-const brief = (v) => ({ id: String(v.id), url: v.url, title: v.title, thumb: v.thumb, duration: v.duration || '', hd: !!v.hd, preview: v.preview || '' })
-const isFav = (id) => store.get('favorites', []).some((x) => x.id === String(id))
+// 舊資料沒有 site（只有第一個來源）
+const vsite = (v) => v.site || 'rv'
+const vkey = (v) => `${vsite(v)}:${v.id}`
+const brief = (v) => ({ site: vsite(v), id: String(v.id), url: v.url, title: v.title, thumb: v.thumb, duration: v.duration || '', hd: !!v.hd, vertical: !!v.vertical, preview: v.preview || '' })
+const isFav = (v) => store.get('favorites', []).some((x) => vkey(x) === vkey(v))
 
 function toggleFav(v) {
   const list = store.get('favorites', [])
-  const i = list.findIndex((x) => x.id === String(v.id))
+  const i = list.findIndex((x) => vkey(x) === vkey(v))
   if (i >= 0) list.splice(i, 1)
   else list.unshift({ ...brief(v), time: Date.now() })
   store.set('favorites', list)
@@ -73,11 +130,11 @@ function toggleFav(v) {
 
 function saveHistory(v, pos, len) {
   if (!store.get('keepHistory', true)) return
-  const list = store.get('history', []).filter((x) => x.id !== String(v.id))
+  const list = store.get('history', []).filter((x) => vkey(x) !== vkey(v))
   list.unshift({ ...brief(v), time: Date.now(), pos: pos || 0, len: len || 0 })
   store.set('history', list.slice(0, 500))
 }
-const historyOf = (id) => store.get('history', []).find((x) => x.id === String(id))
+const historyOf = (v) => store.get('history', []).find((x) => vkey(x) === vkey(v))
 
 // ---------- 下載狀態 ----------
 
@@ -85,8 +142,9 @@ const jobs = new Map()
 const dlListeners = new Set()
 
 function updateDlCount() {
-  const n = [...jobs.values()].filter((j) => j.status === 'running' || j.status === 'queued').length
   const el = $('#dlCount')
+  if (!el) return
+  const n = [...jobs.values()].filter((j) => j.status === 'running' || j.status === 'queued').length
   el.textContent = n
   el.classList.toggle('hidden', !n)
 }
@@ -113,7 +171,7 @@ window.hub.dl.list().then((list) => {
 
 async function startDownload(v, src) {
   try {
-    const j = await window.hub.dl.add({ videoId: v.id, pageUrl: v.url, title: v.title, thumb: v.thumb, duration: v.duration, height: src.height, label: src.label })
+    const j = await window.hub.dl.add({ site: vsite(v), videoId: v.id, pageUrl: v.url, title: v.title, thumb: v.thumb, duration: v.duration, height: src.height, label: src.label })
     jobs.set(j.id, j)
     updateDlCount()
     toast(j.status === 'done' ? '這個畫質已經下載過了' : `已加入下載：${src.label}`)
@@ -125,9 +183,9 @@ async function startDownload(v, src) {
 // ---------- 影片卡片 ----------
 
 let previewTimer = null
-function videoCard(v, extra) {
+function videoCard(v, { extra = null, badge = false } = {}) {
   const thumb = h('div', { class: 'thumb' }, h('img', { src: v.thumb, loading: 'lazy', alt: '' }), v.duration ? h('span', { class: 'dur' }, v.duration) : null, v.hd ? h('span', { class: 'hd' }, 'HD') : null)
-  const hist = historyOf(v.id)
+  const hist = historyOf(v)
   if (hist && hist.len) thumb.append(h('div', { class: 'progress' }, h('i', { style: `width:${Math.min(100, (hist.pos / hist.len) * 100)}%` })))
   if (v.preview && store.get('hoverPreview', true)) {
     // 滑鼠停一下才載入預覽片段，掃過去不會一直下載
@@ -145,11 +203,25 @@ function videoCard(v, extra) {
       thumb.querySelector('video')?.remove()
     }
   }
-  const meta = [zhAgo(v.added), v.views ? `${v.views} 次觀看` : '', v.rating ? `👍 ${v.rating}` : ''].filter(Boolean).join(' · ')
-  return h('div', { class: 'card', onclick: () => openVideo(v) }, thumb, h('div', { class: 'title', title: v.title }, v.title), meta ? h('div', { class: 'meta' }, meta) : null, extra || null)
+  const meta = [v.author, zhAgo(v.added), v.views ? (/次/.test(v.views) ? v.views : `${v.views} 次觀看`) : '', v.rating ? `👍 ${v.rating}` : ''].filter(Boolean).join(' · ')
+  return h(
+    'div',
+    { class: `card${v.vertical ? ' vertical' : ''}`, onclick: () => openVideo(v) },
+    thumb,
+    h('div', { class: 'title', title: v.title }, badge ? siteBadge(vsite(v)) : null, v.title),
+    meta ? h('div', { class: 'meta' }, meta) : null,
+    extra,
+  )
 }
 
-/** 會一直往下載入的影片列表；loader(page) → { items, hasMore } */
+/** 卡片放進格子；直式海報比較窄，整頁都是海報時格子也縮小 */
+function gridOf(cards, items) {
+  const grid = h('div', { class: 'grid' }, cards)
+  if (items && items.length && items.every((v) => v.vertical)) grid.classList.add('posters')
+  return grid
+}
+
+/** 會一直往下載入的列表；loader(page) → { items, hasMore } */
 function infiniteGrid(container, loader, makeCard) {
   const grid = h('div', { class: 'grid' })
   const foot = h('div', { class: 'foot' })
@@ -167,6 +239,7 @@ function infiniteGrid(container, loader, makeCard) {
       const r = await loader(page + 1)
       if (token !== navToken) return
       page++
+      if (page === 1 && r.items.length && r.items.every((v) => v.vertical)) grid.classList.add('posters')
       for (const it of r.items) {
         const key = it.id || it.slug
         if (seen.has(key)) continue
@@ -199,14 +272,14 @@ const backStack = []
 view.addEventListener('scroll', () => scrollHook && scrollHook())
 
 function nav(name, params = {}, { push = true } = {}) {
-  if (push && current) backStack.push({ ...current, scroll: view.scrollTop })
+  if (push && current) backStack.push({ ...current, site: curSite, scroll: view.scrollTop })
   if (backStack.length > 50) backStack.shift()
   current = { name, params }
   navToken++
   scrollHook = null
   view.replaceChildren()
   view.scrollTop = 0
-  for (const b of document.querySelectorAll('.tabs button')) b.classList.toggle('active', b.dataset.nav === name)
+  markTab()
   ;(pages[name] || pages.home)(params)
 }
 
@@ -219,106 +292,139 @@ function goBack() {
     return openVideo(videoStack.pop(), { fromStack: true })
   }
   const prev = backStack.pop()
-  if (prev) nav(prev.name, prev.params, { push: false })
+  if (!prev) return
+  if (prev.site && prev.site !== curSite) setSite(prev.site, { go: false })
+  nav(prev.name, prev.params, { push: false })
 }
 
 /** 篩選列：內容類型 + 排序 */
-function filterBar(params, { sorts = site.SORTS, defSort = 'post_date', types = true } = {}) {
-  const type = params.type ?? store.get('type', '')
-  const sort = params.sort ?? defSort
+function filterBar(params, { sorts, types = null, remember = true }) {
+  // 首頁 / 分類列表記住上次選的類型；搜尋每次從「全部」開始
+  const typeKey = `type_${curSite}`
+  const type = types ? params.type ?? (remember ? store.get(typeKey, '') : '') : ''
+  const sort = params.sort ?? sorts[0]?.id ?? ''
   const bar = h('div', { class: 'filters' })
   if (types) {
-    const chips = h('div', { class: 'chips' })
-    for (const t of site.TYPES) {
-      chips.append(
-        h(
-          'button',
-          {
-            class: `chip${t.id === type ? ' on' : ''}`,
-            onclick: () => {
-              store.set('type', t.id)
-              nav(current.name, { ...params, type: t.id }, { push: false })
+    bar.append(
+      h(
+        'div',
+        { class: 'chips' },
+        types.map((t) =>
+          h(
+            'button',
+            {
+              class: `chip${t.id === type ? ' on' : ''}`,
+              onclick: () => {
+                if (remember) store.set(typeKey, t.id)
+                nav(current.name, { ...params, type: t.id }, { push: false })
+              },
             },
-          },
-          t.name,
+            t.name,
+          ),
         ),
-      )
-    }
-    bar.append(chips)
+      ),
+    )
   }
-  const sel = h('select', { class: 'sort', onchange: () => nav(current.name, { ...params, sort: sel.value }, { push: false }) }, sorts.map((s) => h('option', { value: s.id, selected: s.id === sort }, s.name)))
-  bar.append(h('label', { class: 'sort-wrap' }, '排序', sel))
+  if (sorts.length) {
+    const sel = h('select', { class: 'sort', onchange: () => nav(current.name, { ...params, sort: sel.value }, { push: false }) }, sorts.map((s) => h('option', { value: s.id, selected: s.id === sort }, s.name)))
+    bar.append(h('label', { class: 'sort-wrap' }, '排序', sel))
+  }
   return { bar, type, sort }
+}
+
+/** 收藏 / 紀錄的來源篩選 */
+function siteFilter(key, onChange) {
+  const cur = store.get(key, '')
+  return h(
+    'div',
+    { class: 'chips' },
+    [['', '全部'], ...SITE_KEYS.map((k) => [k, siteLabel(k)])].map(([k, name]) =>
+      h(
+        'button',
+        {
+          class: `chip${k === cur ? ' on' : ''}`,
+          onclick: () => {
+            store.set(key, k)
+            onChange()
+          },
+        },
+        name,
+      ),
+    ),
+  )
 }
 
 const pages = {
   home(params) {
-    const { bar, type, sort } = filterBar(params)
-    view.append(h('div', { class: 'page-head' }, h('h1', {}, '最新影片'), bar))
-    infiniteGrid(view, (page) => site.videoList({ kind: 'latest', page, sort: sort === 'post_date' ? '' : sort, type }), (v) => videoCard(v))
+    const s = siteOf(curSite)
+    const { bar, type, sort } = filterBar(params, { sorts: s.filters.sorts, types: s.filters.types })
+    view.append(h('div', { class: 'page-head' }, h('h1', {}, siteLabel(curSite)), bar))
+    infiniteGrid(view, (page) => s.list({ kind: 'latest', page, sort, type }), (v) => videoCard(v))
   },
 
   list(params) {
     const { kind, slug, q, name } = params
-    const { bar, type, sort } = filterBar(params, { defSort: kind === 'search' ? '' : 'post_date', sorts: kind === 'search' ? [{ id: '', name: '最相關' }, ...site.SORTS] : site.SORTS })
+    const s = siteOf(curSite)
+    const { bar, type, sort } = filterBar(params, { sorts: kind === 'search' ? s.filters.searchSorts : s.filters.sorts, types: curSite === 'h1' ? s.filters.types : kind === 'search' ? null : s.filters.types, remember: kind !== 'search' })
     const label = { search: '搜尋', tags: '標籤', categories: '分類', models: '作者' }[kind]
     const title = h('h1', {}, h('span', { class: 'dim' }, `${label}：`), kind === 'search' ? q : name || slug)
-    const head = h('div', { class: 'page-head' }, title, bar)
-    if (kind !== 'search') {
-      const key = `${kind}/${slug}`
-      const follows = () => store.get('follows', [])
-      const on = () => follows().some((f) => f.key === key)
-      const btn = h('button', { class: 'btn small' })
-      const paint = () => (btn.textContent = on() ? '★ 已追蹤' : '☆ 追蹤')
-      btn.onclick = () => {
-        const list = follows().filter((f) => f.key !== key)
-        if (!on()) list.unshift({ key, kind, slug, name: name || slug })
-        store.set('follows', list)
-        paint()
-      }
+    const key = `${curSite}/${kind}/${kind === 'search' ? q : slug}`
+    const follows = () => store.get('follows', [])
+    const on = () => follows().some((f) => f.key === key)
+    const btn = h('button', { class: 'btn small' })
+    const paint = () => (btn.textContent = on() ? '★ 已追蹤' : '☆ 追蹤')
+    btn.onclick = () => {
+      const list = follows().filter((f) => f.key !== key)
+      if (!on()) list.unshift({ key, site: curSite, kind, slug: kind === 'search' ? q : slug, name: kind === 'search' ? q : name || slug })
+      store.set('follows', list)
       paint()
-      title.append(btn)
     }
-    view.append(head)
-    infiniteGrid(view, (page) => site.videoList({ kind, slug, q, page, sort: sort === 'post_date' && kind !== 'search' ? '' : sort, type }), (v) => videoCard(v))
+    paint()
+    title.append(btn)
+    view.append(h('div', { class: 'page-head' }, title, bar))
+    infiniteGrid(view, (page) => s.list({ kind, slug, q, page, sort, type }), (v) => videoCard(v))
   },
 
-  groups(params) {
+  async groups(params) {
     const kind = params.kind
-    const sorts =
-      kind === 'models'
-        ? [
-            { id: '', name: '熱門' },
-            { id: 'title', name: '名稱' },
-            { id: 'total_videos', name: '影片數' },
-            { id: 'avg_videos_rating', name: '評分' },
-          ]
-        : [
-            { id: 'total_videos', name: '影片數' },
-            { id: '', name: '熱門' },
-            { id: 'title', name: '名稱' },
-            { id: 'avg_videos_rating', name: '評分' },
-          ]
-    const { bar, sort } = filterBar(params, { sorts, defSort: sorts[0].id, types: false })
-    const follows = store.get('follows', []).filter((f) => f.kind === kind)
-    view.append(h('div', { class: 'page-head' }, h('h1', {}, kind === 'models' ? '作者' : '分類'), bar))
+    const s = siteOf(curSite)
+    const tab = s.groupTabs.find((g) => g.kind === kind) || s.groupTabs[0]
+    if (!tab) return nav('home', {}, { push: false })
+    const { bar, sort } = filterBar(params, { sorts: s.groupSorts(kind) })
+    view.append(h('div', { class: 'page-head' }, h('h1', {}, tab.name), bar))
+    const follows = store.get('follows', []).filter((f) => (f.site || 'rv') === curSite)
     if (follows.length) {
       view.append(
         h(
           'div',
           { class: 'follow-row' },
           h('span', { class: 'dim' }, '追蹤中：'),
-          follows.map((f) => h('button', { class: 'chip on', onclick: () => nav('list', { kind: f.kind, slug: f.slug, name: f.name }) }, f.name)),
+          follows.map((f) => h('button', { class: 'chip on', onclick: () => nav('list', f.kind === 'search' ? { kind: 'search', q: f.slug } : { kind: f.kind, slug: f.slug, name: f.name }) }, f.name)),
         ),
       )
     }
+    const openGroup = (g) => nav('list', { kind, slug: g.slug, name: g.name })
+    // 標籤這種沒有圖的，整組列成按鈕
+    if (!s.groupSorts(kind).length && kind === 'tags') {
+      const box = h('div', {}, loading())
+      view.append(box)
+      const token = navToken
+      try {
+        const r = await s.groups(kind)
+        if (token !== navToken) return
+        box.replaceChildren(...r.sections.map((sec) => h('section', { class: 'tag-section' }, h('h2', {}, sec.title), h('div', { class: 'chips' }, sec.items.map((g) => h('button', { class: 'chip', onclick: () => openGroup(g) }, g.name))))))
+      } catch (e) {
+        box.replaceChildren(status(`載入失敗：${errText(e)}`, () => nav('groups', params, { push: false })))
+      }
+      return
+    }
     infiniteGrid(
       view,
-      (page) => site.groups(kind, page, sort),
+      (page) => s.groups(kind, page, sort),
       (g) =>
         h(
           'div',
-          { class: `gcard ${kind}`, onclick: () => nav('list', { kind, slug: g.slug, name: g.name }) },
+          { class: `gcard ${kind}`, onclick: () => openGroup(g) },
           h('div', { class: 'gimg' }, g.img ? h('img', { src: g.img, loading: 'lazy', alt: '' }) : h('span', {}, g.name.slice(0, 1).toUpperCase())),
           h('div', { class: 'gname' }, g.name),
           g.count ? h('div', { class: 'meta' }, g.count) : null,
@@ -327,41 +433,51 @@ const pages = {
   },
 
   favorites() {
-    const list = store.get('favorites', [])
-    view.append(h('div', { class: 'page-head' }, h('h1', {}, `收藏（${list.length}）`)))
+    const filterKey = 'favSite'
+    const all = store.get('favorites', [])
+    const f = store.get(filterKey, '')
+    const list = all.filter((v) => !f || vsite(v) === f)
+    view.append(h('div', { class: 'page-head' }, h('h1', {}, `收藏（${list.length}）`), h('div', { class: 'filters' }, siteFilter(filterKey, () => nav('favorites', {}, { push: false })))))
     if (!list.length) return view.append(status('還沒有收藏。在影片頁按「☆ 收藏」加入。'))
-    const grid = h('div', { class: 'grid' })
-    for (const v of list) {
-      const rm = h('button', {
-        class: 'card-x',
-        title: '取消收藏',
-        onclick: (e) => {
-          e.stopPropagation()
-          toggleFav(v)
-          card.remove()
+    const cards = list.map((v) => {
+      const rm = h(
+        'button',
+        {
+          class: 'card-x',
+          title: '取消收藏',
+          onclick: (e) => {
+            e.stopPropagation()
+            toggleFav(v)
+            card.remove()
+          },
         },
-      }, '×')
-      const card = videoCard(v, rm)
-      grid.append(card)
-    }
-    view.append(grid)
+        '×',
+      )
+      const card = videoCard(v, { extra: rm, badge: true })
+      return card
+    })
+    view.append(gridOf(cards, list))
   },
 
   history() {
-    const list = store.get('history', [])
-    const clear = h('button', {
-      class: 'btn small',
-      onclick: () => {
-        if (!confirm('清除全部觀看紀錄？')) return
-        store.set('history', [])
-        nav('history', {}, { push: false })
+    const filterKey = 'histSite'
+    const f = store.get(filterKey, '')
+    const list = store.get('history', []).filter((v) => !f || vsite(v) === f)
+    const clear = h(
+      'button',
+      {
+        class: 'btn small',
+        onclick: () => {
+          if (!confirm('清除全部觀看紀錄？')) return
+          store.set('history', [])
+          nav('history', {}, { push: false })
+        },
       },
-    }, '清除紀錄')
-    view.append(h('div', { class: 'page-head' }, h('h1', {}, '觀看紀錄'), list.length ? clear : null))
+      '清除紀錄',
+    )
+    view.append(h('div', { class: 'page-head' }, h('h1', {}, '觀看紀錄'), h('div', { class: 'filters' }, siteFilter(filterKey, () => nav('history', {}, { push: false })), clear)))
     if (!list.length) return view.append(status('還沒有觀看紀錄'))
-    const grid = h('div', { class: 'grid' })
-    for (const v of list) grid.append(videoCard({ ...v, added: '' }, h('div', { class: 'meta' }, `${new Date(v.time).toLocaleString()}${v.len ? ` · 看到 ${fmtTime(v.pos)} / ${fmtTime(v.len)}` : ''}`)))
-    view.append(grid)
+    view.append(gridOf(list.map((v) => videoCard({ ...v, added: '' }, { badge: true, extra: h('div', { class: 'meta' }, `${new Date(v.time).toLocaleString()}${v.len ? ` · 看到 ${fmtTime(v.pos)} / ${fmtTime(v.len)}` : ''}`) })), list))
   },
 
   async downloads() {
@@ -388,11 +504,12 @@ const pages = {
       const list = [...jobs.values()].sort((a, b) => b.added - a.added)
       if (!list.length) return box.replaceChildren(status('還沒有下載。在影片頁按「下載」選畫質。'))
       if (!rows.size) box.replaceChildren()
-      for (const j of list) if (!rows.has(j.id)) {
-        const r = dlRow(j)
-        rows.set(j.id, r)
-        box.append(r.el)
-      }
+      for (const j of list)
+        if (!rows.has(j.id)) {
+          const r = dlRow(j)
+          rows.set(j.id, r)
+          box.append(r.el)
+        }
     }
     render()
     const token = navToken
@@ -428,14 +545,18 @@ const pages = {
 
     // 版本與更新
     const st = h('span', { class: 'dim' })
-    const checkBtn = h('button', {
-      class: 'btn',
-      onclick: async () => {
-        st.textContent = '檢查中…'
-        const r = await checkUpdate(true)
-        st.textContent = { dev: '開發版不檢查更新', latest: '已經是最新版', shown: '有新版本，請看右下角', error: '檢查失敗（網路問題？）' }[r]
+    const checkBtn = h(
+      'button',
+      {
+        class: 'btn',
+        onclick: async () => {
+          st.textContent = '檢查中…'
+          const r = await checkUpdate(true)
+          st.textContent = { dev: '開發版不檢查更新', latest: '已經是最新版', shown: '有新版本，請看右下角', error: '檢查失敗（網路問題？）' }[r]
+        },
       },
-    }, '檢查更新')
+      '檢查更新',
+    )
     box.append(section('版本', h('div', { class: 'row' }, h('b', {}, versionText()), checkBtn, h('button', { class: 'btn', onclick: () => showChangelog() }, '更新紀錄'), st)))
 
     // 播放
@@ -456,31 +577,34 @@ const pages = {
     window.hub.dl.dir().then((d) => (dirEl.textContent = d))
     box.append(section('下載', h('div', { class: 'row' }, '下載位置：', dirEl, h('button', { class: 'btn small', onclick: async () => (dirEl.textContent = await window.hub.dl.chooseDir()) }, '變更'))))
 
-    // 網址
-    const inp = h('input', { type: 'text', class: 'input', spellcheck: false })
-    window.hub.config().then((c) => (inp.value = c.base))
-    box.append(
-      section(
-        '連線',
-        h('div', { class: 'dim' }, '網站換網域時可以在這裡改（留空恢復預設）'),
+    // 各來源網址
+    const rows = SITE_KEYS.map((k) => {
+      const inp = h('input', { type: 'text', class: 'input', spellcheck: false, value: siteCfg[k].base })
+      return h(
+        'div',
+        { class: 'row' },
+        h('b', { class: 'site-name' }, siteLabel(k)),
+        inp,
         h(
-          'div',
-          { class: 'row' },
-          inp,
-          h('button', {
+          'button',
+          {
             class: 'btn',
             onclick: async () => {
               try {
-                inp.value = (await window.hub.setBase(inp.value)).base
+                const c = await window.hub.setBase(k, inp.value)
+                Object.assign(siteCfg, c)
+                inp.value = c[k].base
                 toast('已儲存')
               } catch (e) {
                 toast(errText(e))
               }
             },
-          }, '儲存'),
+          },
+          '儲存',
         ),
-      ),
-    )
+      )
+    })
+    box.append(section('連線', h('div', { class: 'dim' }, '網站換網域時可以在這裡改（清空後儲存恢復預設）'), ...rows))
   },
 }
 
@@ -488,7 +612,7 @@ function dlRow(j) {
   const bar = h('i')
   const info = h('div', { class: 'dl-info' })
   const btns = h('div', { class: 'dl-btns' })
-  const el = h('div', { class: 'dl-row' }, h('img', { src: j.thumb, alt: '' }), h('div', { class: 'dl-main' }, h('div', { class: 'title' }, j.title), h('div', { class: 'bar' }, bar), info), btns)
+  const el = h('div', { class: 'dl-row' }, h('img', { src: j.thumb, alt: '' }), h('div', { class: 'dl-main' }, h('div', { class: 'title' }, siteBadge(vsite(j)), j.title), h('div', { class: 'bar' }, bar), info), btns)
   const btn = (text, fn, cls = '') => h('button', { class: `btn small ${cls}`, onclick: fn }, text)
   function update(x) {
     j = x
@@ -508,7 +632,8 @@ function dlRow(j) {
       const file = j.status === 'done' && confirm('要一併把影片檔丟到資源回收筒嗎？\n（按「取消」只從列表移除，檔案保留）')
       await window.hub.dl.remove(j.id, file)
     })
-    if (j.status === 'done') btns.replaceChildren(btn('播放', () => playLocal(j), 'primary'), btn('開啟位置', () => window.hub.dl.show(j.id)), btn('影片頁', () => openVideo({ id: j.videoId, url: j.pageUrl, title: j.title, thumb: j.thumb })), del)
+    const page = () => openVideo({ site: vsite(j), id: j.videoId, url: j.pageUrl, title: j.title, thumb: j.thumb })
+    if (j.status === 'done') btns.replaceChildren(btn('播放', () => playLocal(j), 'primary'), btn('開啟位置', () => window.hub.dl.show(j.id)), btn('影片頁', page), del)
     else if (j.status === 'running' || j.status === 'queued') btns.replaceChildren(btn('暫停', () => window.hub.dl.pause(j.id)), del)
     else btns.replaceChildren(btn(j.status === 'error' ? '重試' : '繼續', () => window.hub.dl.resume(j.id), 'primary'), del)
   }
@@ -518,7 +643,7 @@ function dlRow(j) {
 
 async function playLocal(j) {
   if (!(await window.hub.dl.exists(j.id))) return toast('找不到影片檔（可能被移動或刪除了）')
-  openVideo({ id: j.videoId, url: j.pageUrl, title: j.title, thumb: j.thumb, duration: j.duration }, { local: j })
+  openVideo({ site: vsite(j), id: j.videoId, url: j.pageUrl, title: j.title, thumb: j.thumb, duration: j.duration }, { local: j })
 }
 
 // ---------- 影片頁 / 播放器 ----------
@@ -555,6 +680,14 @@ function pickSource(list) {
   return list.filter((s) => s.height <= want).pop() || list[0]
 }
 
+/** 影片頁裡的標籤 / 作者按鈕：開該來源的列表 */
+function openTag(siteKey, t) {
+  closeVideo()
+  if (siteKey !== curSite) setSite(siteKey, { go: false })
+  if (t.kind === 'search') nav('list', { kind: 'search', q: t.slug })
+  else nav('list', { kind: t.kind, slug: t.slug, name: t.name })
+}
+
 async function openVideo(v, { local = null, fromStack = false } = {}) {
   if (currentVideo && !fromStack) {
     savePos()
@@ -562,20 +695,22 @@ async function openVideo(v, { local = null, fromStack = false } = {}) {
   }
   clearInterval(saveTimer)
   const token = ++videoToken
+  const sk = vsite(v)
+  const s = siteOf(sk)
   currentVideo = brief(v)
   player.classList.remove('hidden')
   player.scrollTop = 0
 
-  const vid = h('video', { class: 'main', controls: true, preload: 'auto', poster: v.thumb || '' })
+  const vid = h('video', { class: 'main', controls: true, preload: 'auto', poster: v.vertical ? '' : v.thumb || '' })
   const qBox = h('div', { class: 'quality' })
   const stage = h('div', { class: 'stage' }, vid)
   const back = h('button', { class: 'back', onclick: goBack, title: '返回 (Esc)' }, '← 返回')
   const infoBox = h('div', { class: 'vinfo' }, h('h1', {}, v.title || ''), loading())
+  const listBox = h('div', { class: 'related' })
   const relBox = h('div', { class: 'related' })
-  player.replaceChildren(h('div', { class: 'vp' }, h('div', { class: 'vp-top' }, back, qBox), stage, infoBox, relBox))
+  player.replaceChildren(h('div', { class: 'vp' }, h('div', { class: 'vp-top' }, back, siteBadge(sk), qBox), stage, infoBox, listBox, relBox))
 
   let sources = []
-  let info = null
   const setSource = (src) => {
     const t = vid.currentTime
     const playing = !vid.paused
@@ -586,20 +721,24 @@ async function openVideo(v, { local = null, fromStack = false } = {}) {
   }
   const renderQuality = (cur) => {
     qBox.replaceChildren(
-      ...sources.map((s) =>
-        h('button', {
-          class: `chip${s === cur ? ' on' : ''}`,
-          'data-url': s.url,
-          onclick: () => {
-            if (!local) store.set('quality', s.height)
-            setSource(s)
+      ...sources.map((x) =>
+        h(
+          'button',
+          {
+            class: `chip${x === cur ? ' on' : ''}`,
+            'data-url': x.url,
+            onclick: () => {
+              if (!local) store.set('quality', x.height)
+              setSource(x)
+            },
           },
-        }, s.label),
+          x.label,
+        ),
       ),
     )
   }
   // 從上次看到的地方繼續（快看完的就從頭）
-  const hist = historyOf(v.id)
+  const hist = historyOf(v)
   vid.addEventListener(
     'loadedmetadata',
     () => {
@@ -626,9 +765,9 @@ async function openVideo(v, { local = null, fromStack = false } = {}) {
   }
 
   // 影片資訊和播放網址同時抓
-  const pInfo = site.video(v.url).catch((e) => e)
-  const pSrc = local ? Promise.resolve(null) : window.hub.sources(v.url).catch((e) => e)
-  const [ri, rs] = await Promise.all([pInfo, pSrc])
+  const pInfo = s.video(v.url).catch((e) => e)
+  const pSrc = local ? Promise.resolve(null) : window.hub.sources(sk, v.url).catch((e) => e)
+  const [info, rs] = await Promise.all([pInfo, pSrc])
   if (token !== videoToken) return
 
   if (!local) {
@@ -639,66 +778,91 @@ async function openVideo(v, { local = null, fromStack = false } = {}) {
       const cur = pickSource(sources)
       renderQuality(cur)
       setSource(cur)
+      if (!vid.poster && rs.poster) vid.poster = rs.poster
     }
   }
 
-  if (ri instanceof Error) {
-    infoBox.replaceChildren(h('h1', {}, v.title || ''), status(`讀不到影片資訊：${errText(ri)}`, () => openVideo(v, { local, fromStack: true })))
+  if (info instanceof Error) {
+    infoBox.replaceChildren(h('h1', {}, v.title || ''), status(`讀不到影片資訊：${errText(info)}`, () => openVideo(v, { local, fromStack: true })))
     return
   }
-  info = ri
-  currentVideo = brief({ ...v, ...info, title: info.title || v.title, thumb: v.thumb || info.thumb, duration: v.duration || info.duration })
+  currentVideo = brief({ ...v, title: info.title || v.title, thumb: v.thumb || info.thumb, duration: v.duration || info.duration })
   if (!vid.poster && info.thumb) vid.poster = info.thumb
 
   // 動作按鈕
   const favBtn = h('button', { class: 'btn' })
-  const paintFav = () => (favBtn.textContent = isFav(v.id) ? '★ 已收藏' : '☆ 收藏')
+  const paintFav = () => (favBtn.textContent = isFav(currentVideo) ? '★ 已收藏' : '☆ 收藏')
   favBtn.onclick = () => {
     toggleFav(currentVideo)
     paintFav()
   }
   paintFav()
   const dlMenu = h('div', { class: 'menu hidden' })
-  const dlBtn = h('button', { class: 'btn primary', onclick: (e) => {
-    e.stopPropagation()
-    dlMenu.classList.toggle('hidden')
-  } }, '⬇ 下載')
-  const fillDlMenu = (list) =>
-    dlMenu.replaceChildren(
-      ...list
-        .slice()
-        .reverse()
-        .map((s) => h('button', { onclick: () => {
-          dlMenu.classList.add('hidden')
-          startDownload(currentVideo, s)
-        } }, h('b', {}, s.label), h('span', { class: 'dim' }, s.size || ''))),
-    )
+  const dlBtn = h(
+    'button',
+    {
+      class: 'btn primary',
+      onclick: (e) => {
+        e.stopPropagation()
+        dlMenu.classList.toggle('hidden')
+      },
+    },
+    '⬇ 下載',
+  )
+  const fillDlMenu = (list) => {
+    const rows = list
+      .slice()
+      .reverse()
+      .map((x) => {
+        const size = h('span', { class: 'dim' }, x.size || '')
+        const b = h(
+          'button',
+          {
+            onclick: () => {
+              dlMenu.classList.add('hidden')
+              startDownload(currentVideo, x)
+            },
+          },
+          h('b', {}, x.label),
+          size,
+        )
+        return { b, size, x }
+      })
+    dlMenu.replaceChildren(...rows.map((r) => r.b))
+    // 網站沒附檔案大小的，另外問 CDN
+    const missing = rows.filter((r) => !r.x.size)
+    if (missing.length)
+      window.hub.sizes(sk, missing.map((r) => r.x.url)).then((ns) => ns.forEach((n, i) => n && (missing[i].size.textContent = fmtBytes(n))), () => {})
+  }
   if (local) {
     // 本機播放時另外抓一次網址，才知道有哪些畫質能下載
     dlMenu.replaceChildren(loading())
-    window.hub.sources(v.url).then((r) => token === videoToken && fillDlMenu(r.sources), () => token === videoToken && dlMenu.replaceChildren(status('讀不到下載網址')))
+    window.hub.sources(sk, v.url).then(
+      (r) => token === videoToken && fillDlMenu(r.sources),
+      () => token === videoToken && dlMenu.replaceChildren(status('讀不到下載網址')),
+    )
   } else if (sources.length) fillDlMenu(sources)
   else dlBtn.disabled = true
 
-  const chipRow = (label, list) =>
-    list.length
-      ? h('div', { class: 'tagrow' }, h('span', { class: 'label' }, label), list.map((t) => h('button', { class: `tag ${t.kind}`, onclick: () => {
-          closeVideo()
-          nav('list', { kind: t.kind, slug: t.slug, name: t.name })
-        } }, t.name)))
-      : null
+  const chipRow = (row) =>
+    row.items.length ? h('div', { class: 'tagrow' }, h('span', { class: 'label' }, row.label), row.items.map((t) => h('button', { class: `tag ${t.kind}`, onclick: () => openTag(sk, t) }, t.name))) : null
 
   infoBox.replaceChildren(
     h('h1', {}, currentVideo.title),
-    h('div', { class: 'vmeta' }, [zhAgo(info.added), info.views && `${info.views} 次觀看`, info.duration, info.rating && `👍 ${info.rating}`].filter(Boolean).join(' · ')),
-    h('div', { class: 'actions' }, h('div', { class: 'dl-wrap' }, dlBtn, dlMenu), favBtn, h('button', { class: 'btn', onclick: () => window.hub.config().then((c) => window.hub.external(new URL(v.url, c.base).href)) }, '在瀏覽器開啟')),
+    h('div', { class: 'vmeta' }, [zhAgo(info.added), info.views && (/次/.test(info.views) ? `觀看 ${info.views}` : `${info.views} 次觀看`), info.duration, info.rating && `👍 ${info.rating}`].filter(Boolean).join(' · ')),
+    h(
+      'div',
+      { class: 'actions' },
+      h('div', { class: 'dl-wrap' }, dlBtn, dlMenu),
+      favBtn,
+      h('button', { class: 'btn', onclick: () => window.hub.external(new URL(v.url, siteCfg[sk].base).href) }, '在瀏覽器開啟'),
+    ),
     info.uploader ? h('div', { class: 'uploader' }, info.uploader.avatar ? h('img', { src: info.uploader.avatar, alt: '' }) : null, h('span', {}, `上傳者：${info.uploader.name}`)) : null,
     info.desc ? h('div', { class: 'desc' }, info.desc) : null,
-    chipRow('作者', info.models),
-    chipRow('分類', info.categories),
-    chipRow('標籤', info.tags),
+    ...info.rows.map(chipRow).filter(Boolean),
   )
-  if (info.related.length) relBox.replaceChildren(h('h2', {}, '相關影片'), h('div', { class: 'grid' }, info.related.map((r) => videoCard(r))))
+  if (info.playlist.length > 1) listBox.replaceChildren(h('h2', {}, '同系列 / 播放清單'), gridOf(info.playlist.map((r) => videoCard(r)), info.playlist))
+  if (info.related.length) relBox.replaceChildren(h('h2', {}, '相關影片'), gridOf(info.related.map((r) => videoCard(r)), info.related))
 }
 
 document.addEventListener('click', () => $('.menu:not(.hidden)', player)?.classList.add('hidden'))
@@ -885,14 +1049,9 @@ async function checkUpdate(manual = false) {
 
 // ---------- 啟動 ----------
 
-for (const b of document.querySelectorAll('[data-nav]')) {
-  b.addEventListener('click', () => {
-    if (!player.classList.contains('hidden')) closeVideo()
-    const n = b.dataset.nav
-    if (n === 'categories' || n === 'models') nav('groups', { kind: n })
-    else nav(n)
-    if (n === 'categories' || n === 'models') for (const t of document.querySelectorAll('.tabs button')) t.classList.toggle('active', t.dataset.nav === n)
-  })
+$('.brand').onclick = () => {
+  if (!player.classList.contains('hidden')) closeVideo()
+  nav('home')
 }
 
 const verEl = $('#version')
@@ -906,18 +1065,29 @@ $('#searchForm').addEventListener('submit', (e) => {
   e.preventDefault()
   const q = $('#searchInput').value.trim()
   if (!q) return
-  // 貼上影片網址就直接開
-  const m = q.match(/\/video\/(\d+)\/[^\s]*/)
-  if (m) return openVideo({ id: m[1], url: new URL(q.startsWith('http') ? q : `https://x${q.startsWith('/') ? '' : '/'}${q}`).pathname, title: '' })
+  // 貼上影片網址就直接開（看網址是哪個來源的）
+  if (/^https?:\/\//.test(q) || /watch\?v=|\/video\/\d+/.test(q)) {
+    let host = ''
+    try {
+      host = new URL(q).hostname
+    } catch {}
+    const order = [...SITE_KEYS].sort((a, b) => (host && new URL(siteCfg[b].base).hostname === host) - (host && new URL(siteCfg[a].base).hostname === host))
+    for (const k of order) {
+      const m = SITES[k].matchUrl(q)
+      if (m) return openVideo({ site: k, id: m.id, url: m.url, title: '' })
+    }
+  }
   if (!player.classList.contains('hidden')) closeVideo()
   nav('list', { kind: 'search', q })
 })
 
 window.addEventListener('beforeunload', savePos)
 
+renderSiteSwitch()
+renderTabs()
 nav('home', {}, { push: false })
 setTimeout(() => checkUpdate(), 2500)
 showWhatsNew()
 
 // 測試用
-window.__app = { nav, openVideo, closeVideo, showChangelog, checkUpdate, jobs, site }
+window.__app = { nav, openVideo, closeVideo, setSite, showChangelog, checkUpdate, jobs, SITES }

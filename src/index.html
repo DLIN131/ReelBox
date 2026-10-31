@@ -8,19 +8,12 @@
   </head>
   <body>
     <header class="topbar">
-      <div class="brand" data-nav="home">Reel<span>Box</span></div>
+      <div class="brand">Reel<span>Box</span></div>
       <button id="version" class="version" title="更新紀錄"></button>
-      <nav class="tabs">
-        <button data-nav="home" class="active">首頁</button>
-        <button data-nav="categories">分類</button>
-        <button data-nav="models">作者</button>
-        <button data-nav="favorites">收藏</button>
-        <button data-nav="history">紀錄</button>
-        <button data-nav="downloads">下載<span id="dlCount" class="dl-count hidden"></span></button>
-        <button data-nav="settings">設定</button>
-      </nav>
+      <div class="site-switch" id="siteSwitch" title="切換來源"></div>
+      <nav class="tabs" id="tabs"></nav>
       <form class="search" id="searchForm">
-        <input id="searchInput" type="search" placeholder="搜尋影片、標籤、作者，或貼上影片網址" autocomplete="off" />
+        <input id="searchInput" type="search" placeholder="搜尋目前來源，或貼上影片網址" autocomplete="off" />
         <button type="submit">搜尋</button>
       </form>
     </header>

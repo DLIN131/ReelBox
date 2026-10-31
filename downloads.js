@@ -24,6 +24,8 @@ function load() {
     // 上次關程式時還在下載的，這次接著下
     if (j.status === 'running') j.status = 'queued'
     j.speed = 0
+    // 舊版只有一個來源
+    if (!j.site) j.site = 'rv'
   }
 }
 
@@ -91,7 +93,7 @@ async function run(j) {
   emit(j, true)
   try {
     // 網址有時效，每次開始都重抓影片頁拿新的
-    const info = await fetcher.sources(j.pageUrl)
+    const info = await fetcher.sources(j.site, j.pageUrl)
     const src = info.sources.find((s) => s.height === j.height) || info.sources.filter((s) => s.height <= j.height).pop() || info.sources[info.sources.length - 1]
     if (!j.file) {
       j.label = src.label
@@ -103,7 +105,7 @@ async function run(j) {
     try {
       got = fs.statSync(part).size
     } catch {}
-    const headers = { Referer: fetcher.base() + '/' }
+    const headers = { Referer: fetcher.base(j.site) + '/' }
     if (got > 0) headers.Range = `bytes=${got}-`
     const res = await session.defaultSession.fetch(src.url, { headers, signal: ctl.signal })
     if (res.status === 416 && got > 0) {
@@ -190,10 +192,12 @@ function setup() {
   })
   ipcMain.handle('dl:add', (_e, v) => {
     // 同一部影片同一畫質已經在佇列或下載完，就不重複加
-    const same = jobs.find((j) => j.videoId === v.videoId && j.height === v.height && j.status !== 'error')
+    const site = v.site || 'rv'
+    const same = jobs.find((j) => j.site === site && j.videoId === String(v.videoId) && j.height === v.height && j.status !== 'error')
     if (same) return publicJob(same)
     const j = {
       id: `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+      site,
       videoId: String(v.videoId),
       pageUrl: v.pageUrl,
       title: v.title || '',
