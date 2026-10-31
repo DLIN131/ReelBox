@@ -623,7 +623,7 @@ function dlRow(j) {
     info.textContent =
       {
         queued: '等待中',
-        running: `下載中 ${pct}% · ${size}${j.speed ? ` · ${fmtBytes(j.speed)}/s` : ''}`,
+        running: `下載中 ${pct}% · ${size}${j.speed ? ` · ${fmtBytes(j.speed)}/s` : ''}${j.hosts > 1 ? ` · ${j.hosts} 台伺服器同時下載` : ''}`,
         paused: `已暫停 ${size ? `· ${size}` : ''}`,
         done: `完成 · ${fmtBytes(j.total)}`,
         error: `失敗：${j.error}`,

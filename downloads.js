@@ -1,9 +1,13 @@
-// 影片下載佇列（主程序）：可暫停 / 續傳，關掉程式再開會從上次的位置繼續
+// 影片下載佇列（主程序）：可暫停 / 續傳，關掉程式再開會從上次的位置繼續。
+// 檔案切成小段，從所有找得到的 CDN 主機同時下載（見 mirrors.js），寫進 .part 的對應位置。
 const { app, ipcMain, dialog, shell, session, BrowserWindow } = require('electron')
 const fs = require('original-fs')
 const path = require('path')
+const http = require('http')
+const https = require('https')
 const { pathToFileURL } = require('url')
 const fetcher = require('./fetcher')
+const mirrors = require('./mirrors')
 
 const MAX_RUNNING = 2
 const jobsFile = () => path.join(app.getPath('userData'), 'downloads.json')
@@ -84,13 +88,54 @@ function pump() {
   }
 }
 
+// rv 站的 CDN 每「條連線」限速約 0.24 MB/s，開多條就能疊加（16 條約 3.8 MB/s）。
+// Chromium（session.fetch）對同一台主機會把所有請求併進一條 HTTP/2 連線，開再多也只有一條的速度，
+// 所以分段改用 Node 的 https（HTTP/1.1，每條連線各自一個 socket）；它連不上（例如要走系統代理）才退回 session.fetch。
+const CHUNK = 2 * 1048576 // 分段大小；最後幾段也不會拖太久
+const TOTAL_CONN = 16 // 每個下載總共開幾條連線，平均分給各台主機
+const agent = new https.Agent({ keepAlive: true, maxSockets: Infinity })
+const nodeLib = (u) => (u.startsWith('https:') ? https : http)
+
+/** 用 Node 抓一段，回傳 { status, stream } */
+function nodeGet(url, headers, signal) {
+  return new Promise((resolve, reject) => {
+    const req = nodeLib(url).get(url, { agent: url.startsWith('https:') ? agent : undefined, headers: { 'User-Agent': app.userAgentFallback, ...headers } }, (res) => resolve({ status: res.statusCode, stream: res }))
+    const onAbort = () => req.destroy(new Error('aborted'))
+    signal.addEventListener('abort', onAbort, { once: true })
+    req.on('close', () => signal.removeEventListener('abort', onAbort))
+    req.on('error', reject)
+    req.setTimeout(30000, () => req.destroy(new Error('連線逾時')))
+  })
+}
+
+/** 用 Chromium 抓一段（備用），包成跟 nodeGet 一樣的介面 */
+async function chromiumGet(url, headers, signal) {
+  const res = await session.defaultSession.fetch(url, { headers, signal })
+  const reader = res.body.getReader()
+  return {
+    status: res.status,
+    stream: {
+      async *[Symbol.asyncIterator]() {
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) return
+          yield Buffer.from(value)
+        }
+      },
+      destroy: () => reader.cancel().catch(() => {}),
+    },
+  }
+}
+
 async function run(j) {
   const ctl = new AbortController()
   running.set(j.id, ctl)
   j.status = 'running'
   j.error = ''
   j.speed = 0
+  j.hosts = 0
   emit(j, true)
+  let fd = null
   try {
     // 網址有時效，每次開始都重抓影片頁拿新的
     const info = await fetcher.sources(j.site, j.pageUrl)
@@ -100,35 +145,50 @@ async function run(j) {
       j.height = src.height
       j.file = pickFile(j)
     }
+    const referer = fetcher.base(j.site) + '/'
+    const { urls, total } = await mirrors.find(src.url, referer)
+    if (ctl.signal.aborted) throw new Error('aborted')
+    if (!total) throw new Error('伺服器沒有回應檔案大小，請稍後再試')
+    j.hosts = urls.length
     const part = j.file + '.part'
-    let got = 0
+    const n = Math.ceil(total / CHUNK)
+    let partSize = -1
     try {
-      got = fs.statSync(part).size
+      partSize = fs.statSync(part).size
     } catch {}
-    const headers = { Referer: fetcher.base(j.site) + '/' }
-    if (got > 0) headers.Range = `bytes=${got}-`
-    const res = await session.defaultSession.fetch(src.url, { headers, signal: ctl.signal })
-    if (res.status === 416 && got > 0) {
-      // 已經下載完了，只是上次沒改名
-    } else {
-      if (!res.ok) throw new Error(`下載失敗：HTTP ${res.status}`)
-      if (res.status !== 206) got = 0 // 伺服器不支援續傳就從頭來
-      const range = res.headers.get('content-range')
-      const len = Number(res.headers.get('content-length')) || 0
-      j.total = range ? Number(range.split('/')[1]) || got + len : len
-      j.got = got
-      const out = fs.createWriteStream(part, { flags: got > 0 ? 'a' : 'w' })
-      const done = new Promise((resolve, reject) => {
-        out.on('error', reject)
-        out.on('finish', resolve)
-      })
-      const reader = res.body.getReader()
-      let winStart = Date.now()
-      let winBytes = 0
+    // 續傳：同一個檔案（大小一樣）就沿用已完成的分段；舊版是從頭依序下載，前面完整的部分也算完成
+    if (j.total !== total || typeof j.chunks !== 'string' || j.chunks.length !== n || partSize < 0) {
+      const keep = partSize > 0 && j.total === total ? Math.floor(partSize / CHUNK) : 0
+      j.chunks = '1'.repeat(Math.min(keep, n)) + '0'.repeat(n - Math.min(keep, n))
+    }
+    j.total = total
+    fd = fs.openSync(part, partSize < 0 ? 'w+' : 'r+')
+    fs.ftruncateSync(fd, total)
+    const done = j.chunks.split('').map((c) => c === '1')
+    const chunkLen = (i) => Math.min(CHUNK, total - i * CHUNK)
+    j.got = done.reduce((a, d, i) => a + (d ? chunkLen(i) : 0), 0)
+    const busy = new Set()
+    let winStart = Date.now()
+    let winBytes = 0
+    const nextChunk = () => {
+      for (let i = 0; i < n; i++) if (!done[i] && !busy.has(i)) return i
+      return -1
+    }
+
+    async function getChunk(url, i, viaChromium) {
+      const start = i * CHUNK
+      const end = start + chunkLen(i) - 1
+      const res = await (viaChromium ? chromiumGet : nodeGet)(url, { Range: `bytes=${start}-${end}`, Referer: referer }, ctl.signal)
+      if (res.status !== 206) {
+        res.stream.destroy()
+        throw new Error(`HTTP ${res.status}`)
+      }
+      let pos = start
       try {
-        for (;;) {
-          const { done: end, value } = await reader.read()
-          if (end) break
+        for await (const value of res.stream) {
+          if (pos + value.length > end + 1) throw new Error('伺服器回傳的資料超出範圍')
+          fs.writeSync(fd, value, 0, value.length, pos)
+          pos += value.length
           j.got += value.length
           winBytes += value.length
           const now = Date.now()
@@ -137,19 +197,55 @@ async function run(j) {
             winStart = now
             winBytes = 0
           }
-          if (!out.write(value)) await new Promise((r) => out.once('drain', r))
           emit(j)
         }
-      } finally {
-        out.end()
-        await done.catch(() => {})
+      } catch (e) {
+        j.got -= pos - start
+        throw e
       }
-      if (j.total && j.got < j.total) throw new Error('連線中斷，檔案沒下載完（可按「繼續」續傳）')
+      if (pos !== end + 1) {
+        j.got -= pos - start
+        throw new Error('分段沒下載完')
+      }
     }
+
+    // 每台主機開幾條連線，各自搶還沒下載的分段；快的主機自然會搶到比較多段
+    async function worker(url) {
+      let fails = 0
+      let viaChromium = false
+      for (;;) {
+        if (ctl.signal.aborted) return
+        const i = nextChunk()
+        if (i < 0) return
+        busy.add(i)
+        try {
+          await getChunk(url, i, viaChromium)
+          done[i] = true
+          fails = 0
+          j.chunks = done.map((d) => (d ? '1' : '0')).join('')
+          save()
+        } catch (e) {
+          if (ctl.signal.aborted) return
+          // 失敗一次就改用 Chromium 試；同一條連續失敗 3 次就不用了，其他連線繼續
+          viaChromium = true
+          if (++fails >= 3) return
+          await new Promise((r) => setTimeout(r, 1000 * fails))
+        } finally {
+          busy.delete(i)
+        }
+      }
+    }
+    const per = Math.max(2, Math.ceil(TOTAL_CONN / urls.length))
+    await Promise.all(urls.flatMap((u) => Array.from({ length: per }, () => worker(u))))
+    if (ctl.signal.aborted) throw new Error('aborted')
+    if (done.some((d) => !d)) throw new Error('連線中斷，檔案沒下載完（可按「繼續」續傳）')
+    fs.closeSync(fd)
+    fd = null
     fs.renameSync(part, j.file)
     try {
       j.total = j.got = fs.statSync(j.file).size
     } catch {}
+    delete j.chunks
     j.status = 'done'
     j.finished = Date.now()
   } catch (e) {
@@ -160,6 +256,11 @@ async function run(j) {
       j.error = e.message || String(e)
     }
   } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd)
+      } catch {}
+    }
     j.speed = 0
     running.delete(j.id)
     save()
