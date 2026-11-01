@@ -66,15 +66,12 @@ const siteBadge = (k) => h('span', { class: `site-badge ${k}` }, siteLabel(k))
 
 function setSite(k, { go = true } = {}) {
   if (!SITES[k]) return
+  if (go) record()
   curSite = k
   store.set('site', k)
   renderSiteSwitch()
   renderTabs()
-  if (go) {
-    if (!player.classList.contains('hidden')) closeVideo()
-    backStack.length = 0
-    nav('home', {}, { push: false })
-  }
+  if (go) nav('home', {}, { push: false })
 }
 
 function renderSiteSwitch() {
@@ -83,26 +80,25 @@ function renderSiteSwitch() {
 
 /** 上方分頁：首頁、該來源的分類類分頁、收藏、紀錄、下載、設定 */
 function renderTabs() {
-  const tabs = [['home', '首頁'], ...siteOf(curSite).groupTabs.map((g) => [`group:${g.kind}`, g.name]), ['favorites', '收藏'], ['history', '紀錄'], ['downloads', '下載'], ['settings', '設定']]
+  const s = siteOf(curSite)
+  const tabs = [['home', '首頁'], ...s.groupTabs.map((g) => [`group:${g.kind}`, g.name]), ...(s.followKinds ? [['follows', '追蹤']] : []), ['favorites', '收藏'], ['history', '紀錄'], ['downloads', '下載'], ['settings', '設定']]
   $('#tabs').replaceChildren(
     ...tabs.map(([id, name]) =>
       h(
         'button',
         {
           'data-nav': id,
-          onclick: () => {
-            if (!player.classList.contains('hidden')) closeVideo()
-            if (id.startsWith('group:')) nav('groups', { kind: id.slice(6) })
-            else nav(id)
-          },
+          onclick: () => (id.startsWith('group:') ? nav('groups', { kind: id.slice(6) }) : nav(id)),
         },
         name,
         id === 'downloads' ? h('span', { id: 'dlCount', class: 'dl-count hidden' }) : null,
+        id === 'follows' ? h('span', { id: 'followCount', class: 'dl-count hidden', title: '追蹤的作者 / 分類有新影片' }) : null,
       ),
     ),
   )
   markTab()
   updateDlCount()
+  paintFollowCount()
 }
 
 function markTab() {
@@ -137,6 +133,130 @@ function saveHistory(v, pos, len) {
 const historyOf = (v) => store.get('history', []).find((x) => vkey(x) === vkey(v))
 
 // ---------- 下載狀態 ----------
+
+// ---------- 追蹤（作者 / 分類） ----------
+
+// 每筆：{ key, site, kind, slug, name, lastId }；lastId 是上次看到的最新影片編號，拿來算有幾部新影片
+const followKey = (site, t) => `${site}/${t.kind}/${t.slug}`
+const followsOf = (site) => store.get('follows', []).filter((f) => (f.site || 'rv') === site)
+const isFollowing = (key) => store.get('follows', []).some((f) => f.key === key)
+const followNew = new Map() // key → 新影片數
+
+function toggleFollow(site, t) {
+  const key = followKey(site, t)
+  const on = isFollowing(key)
+  const list = store.get('follows', []).filter((f) => f.key !== key)
+  if (!on) list.unshift({ key, site, kind: t.kind, slug: t.slug, name: t.name, added: Date.now() })
+  store.set('follows', list)
+  followNew.delete(key)
+  paintFollowCount()
+  toast(on ? `已取消追蹤「${t.name}」` : `已追蹤「${t.name}」，到「追蹤」分頁看最新影片`)
+  // 剛追蹤的先記下目前最新一部，之後的才算新影片
+  if (!on) checkFollows([key])
+  return !on
+}
+
+function setLastId(key, id) {
+  const list = store.get('follows', [])
+  const f = list.find((x) => x.key === key)
+  if (!f || Number(id) <= Number(f.lastId || 0)) return
+  f.lastId = String(id)
+  store.set('follows', list)
+}
+
+function paintFollowCount() {
+  const el = $('#followCount')
+  if (!el) return
+  const keys = new Set(followsOf(curSite).map((f) => f.key))
+  const n = [...followNew].reduce((a, [k, c]) => a + (keys.has(k) ? c : 0), 0)
+  el.textContent = n > 99 ? '99+' : n
+  el.classList.toggle('hidden', !n)
+}
+
+/** 同時最多跑 n 個 */
+function limiter(n) {
+  let active = 0
+  const q = []
+  const next = () => {
+    if (active >= n || !q.length) return
+    active++
+    const [fn, ok, fail] = q.shift()
+    fn()
+      .then(ok, fail)
+      .finally(() => {
+        active--
+        next()
+      })
+  }
+  return (fn) =>
+    new Promise((ok, fail) => {
+      q.push([fn, ok, fail])
+      next()
+    })
+}
+const followLimit = limiter(4)
+
+/** 追蹤項目的影片列表（依上傳先後）；搜尋類的要指定照日期排 */
+const followList = (f, page, type = '') =>
+  followLimit(() => siteOf(f.site || 'rv').list({ kind: f.kind, slug: f.kind === 'search' ? '' : f.slug, q: f.kind === 'search' ? f.slug : '', page, sort: f.kind === 'search' ? 'post_date' : '', type }))
+const newer = (a, b) => Number(a) > Number(b)
+
+/** 背景看看追蹤的作者 / 分類有沒有新影片，數字顯示在「追蹤」分頁上 */
+let checking = false
+async function checkFollows(only = null) {
+  if (checking && !only) return
+  if (!only) checking = true
+  try {
+    const list = store.get('follows', []).filter((f) => siteOf(f.site || 'rv')?.followKinds && (!only || only.includes(f.key)))
+    await Promise.all(
+      list.map(async (f) => {
+        try {
+          const r = await followList(f, 1)
+          const top = r.items.reduce((m, v) => (newer(v.id, m) ? v.id : m), '0')
+          if (!f.lastId) setLastId(f.key, top)
+          else followNew.set(f.key, r.items.filter((v) => newer(v.id, f.lastId)).length)
+        } catch {}
+      }),
+    )
+  } finally {
+    if (!only) checking = false
+    paintFollowCount()
+  }
+}
+
+/**
+ * 把好幾個列表（各自由新到舊）合成一條由新到舊的動態，往下捲再接著抓。
+ * 影片編號越大越新，用編號比較。回傳 infiniteGrid 用的 loader。
+ */
+function mergedFeed(list, type, onFirst) {
+  const st = list.map((f) => ({ f, page: 0, buf: [], done: false, err: null }))
+  const fill = (x) =>
+    followList(x.f, x.page + 1, type).then(
+      (r) => {
+        x.page++
+        if (x.page === 1) onFirst(x.f, r.items)
+        x.buf.push(...r.items)
+        if (!r.hasMore || !r.items.length) x.done = true
+      },
+      (e) => {
+        x.done = true
+        x.err = e
+      },
+    )
+  return async () => {
+    const out = []
+    while (out.length < 30) {
+      // 每個列表都要看得到下一部，才知道誰比較新
+      await Promise.all(st.filter((x) => !x.buf.length && !x.done).map(fill))
+      const live = st.filter((x) => x.buf.length)
+      if (!live.length) break
+      const best = live.reduce((a, b) => (newer(b.buf[0].id, a.buf[0].id) ? b : a))
+      out.push({ ...best.buf.shift(), author: best.f.name })
+    }
+    if (!out.length && st.length && st.every((x) => x.err)) throw st[0].err
+    return { items: out, hasMore: st.some((x) => x.buf.length || !x.done) }
+  }
+}
 
 const jobs = new Map()
 const dlListeners = new Set()
@@ -184,7 +304,7 @@ async function startDownload(v, src) {
 
 let previewTimer = null
 function videoCard(v, { extra = null, badge = false } = {}) {
-  const thumb = h('div', { class: 'thumb' }, h('img', { src: v.thumb, loading: 'lazy', alt: '' }), v.duration ? h('span', { class: 'dur' }, v.duration) : null, v.hd ? h('span', { class: 'hd' }, 'HD') : null)
+  const thumb = h('div', { class: 'thumb' }, h('img', { src: v.thumb, loading: 'lazy', alt: '' }), v.duration ? h('span', { class: 'dur' }, v.duration) : null, v.hd ? h('span', { class: 'hd' }, 'HD') : null, v.isNew ? h('span', { class: 'new' }, '新') : null)
   const hist = historyOf(v)
   if (hist && hist.len) thumb.append(h('div', { class: 'progress' }, h('i', { style: `width:${Math.min(100, (hist.pos / hist.len) * 100)}%` })))
   if (v.preview && store.get('hoverPreview', true)) {
@@ -262,20 +382,49 @@ function infiniteGrid(container, loader, makeCard) {
   more()
 }
 
-// ---------- 頁面切換 ----------
+// ---------- 頁面切換 / 上一步 ----------
 
+// 每一步（換頁、篩選、開影片、換來源）都記一筆，可以一路返回再前進。
+// 列表頁連畫面一起留著：返回時不用重新載入，捲動位置和已經載入的部分都還在。
 let navToken = 0
+let tokenSeq = 0
 let scrollHook = null
 let current = { name: 'home', params: {} }
 const backStack = []
+const fwdStack = []
+const KEEP_VIEW = new Set(['home', 'list', 'groups', 'follows'])
+const KEEP_VIEWS = 12 // 最近幾筆保留畫面，再舊的返回時重新載入
+const playerOpen = () => !player.classList.contains('hidden')
 
 view.addEventListener('scroll', () => scrollHook && scrollHook())
 
-function nav(name, params = {}, { push = true } = {}) {
-  if (push && current) backStack.push({ ...current, site: curSite, scroll: view.scrollTop })
-  if (backStack.length > 50) backStack.shift()
+/** 目前的狀態：頁面（和它的畫面）＋ 開著的影片 */
+function snapshot() {
+  const e = { name: current.name, params: current.params, site: curSite, scroll: view.scrollTop, token: navToken, hook: scrollHook }
+  if (KEEP_VIEW.has(current.name)) e.nodes = [...view.childNodes]
+  if (playerOpen() && currentVideo) {
+    e.video = currentVideo
+    e.local = currentLocal
+  }
+  return e
+}
+
+function trimViews(stack) {
+  for (let i = 0; i < stack.length - KEEP_VIEWS; i++) delete stack[i].nodes
+}
+
+/** 記下目前狀態，準備往新的地方走 */
+function record() {
+  backStack.push(snapshot())
+  if (backStack.length > 100) backStack.shift()
+  trimViews(backStack)
+  fwdStack.length = 0
+  paintNavBtns()
+}
+
+function render(name, params) {
   current = { name, params }
-  navToken++
+  navToken = ++tokenSeq
   scrollHook = null
   view.replaceChildren()
   view.scrollTop = 0
@@ -283,18 +432,54 @@ function nav(name, params = {}, { push = true } = {}) {
   ;(pages[name] || pages.home)(params)
 }
 
-function goBack() {
-  if (!player.classList.contains('hidden')) {
-    // 影片頁裡點了相關影片：返回上一部影片
-    if (!videoStack.length) return closeVideo()
-    savePos()
-    currentVideo = null
-    return openVideo(videoStack.pop(), { fromStack: true })
+function nav(name, params = {}, { push = true } = {}) {
+  if (push) record()
+  if (playerOpen()) closeVideo()
+  render(name, params)
+  paintNavBtns()
+}
+
+/** 回到某一筆紀錄 */
+function restore(e) {
+  if (e.site !== curSite) setSite(e.site, { go: false })
+  const same = e.nodes && e.nodes[0] && e.nodes[0] === view.firstChild
+  if (!same) {
+    if (e.nodes) {
+      current = { name: e.name, params: e.params }
+      navToken = e.token
+      view.replaceChildren(...e.nodes)
+      view.scrollTop = e.scroll
+      scrollHook = e.hook
+      markTab()
+      // 離開時還沒載完的，回來接著載
+      scrollHook?.()
+    } else render(e.name, e.params)
   }
+  if (e.video) {
+    if (!playerOpen() || !currentVideo || vkey(currentVideo) !== vkey(e.video)) openVideo(e.video, { local: e.local, fromStack: true })
+  } else if (playerOpen()) closeVideo()
+  paintNavBtns()
+}
+
+function goBack() {
   const prev = backStack.pop()
   if (!prev) return
-  if (prev.site && prev.site !== curSite) setSite(prev.site, { go: false })
-  nav(prev.name, prev.params, { push: false })
+  fwdStack.push(snapshot())
+  trimViews(fwdStack)
+  restore(prev)
+}
+
+function goForward() {
+  const next = fwdStack.pop()
+  if (!next) return
+  backStack.push(snapshot())
+  trimViews(backStack)
+  restore(next)
+}
+
+function paintNavBtns() {
+  $('#navBack').disabled = !backStack.length
+  $('#navFwd').disabled = !fwdStack.length
 }
 
 /** 篩選列：內容類型 + 排序 */
@@ -316,7 +501,7 @@ function filterBar(params, { sorts, types = null, remember = true }) {
               class: `chip${t.id === type ? ' on' : ''}`,
               onclick: () => {
                 if (remember) store.set(typeKey, t.id)
-                nav(current.name, { ...params, type: t.id }, { push: false })
+                nav(current.name, { ...params, type: t.id })
               },
             },
             t.name,
@@ -326,7 +511,7 @@ function filterBar(params, { sorts, types = null, remember = true }) {
     )
   }
   if (sorts.length) {
-    const sel = h('select', { class: 'sort', onchange: () => nav(current.name, { ...params, sort: sel.value }, { push: false }) }, sorts.map((s) => h('option', { value: s.id, selected: s.id === sort }, s.name)))
+    const sel = h('select', { class: 'sort', onchange: () => nav(current.name, { ...params, sort: sel.value }) }, sorts.map((s) => h('option', { value: s.id, selected: s.id === sort }, s.name)))
     bar.append(h('label', { class: 'sort-wrap' }, '排序', sel))
   }
   return { bar, type, sort }
@@ -368,15 +553,12 @@ const pages = {
     const { bar, type, sort } = filterBar(params, { sorts: kind === 'search' ? s.filters.searchSorts : s.filters.sorts, types: curSite === 'h1' ? s.filters.types : kind === 'search' ? null : s.filters.types, remember: kind !== 'search' })
     const label = { search: '搜尋', tags: '標籤', categories: '分類', models: '作者' }[kind]
     const title = h('h1', {}, h('span', { class: 'dim' }, `${label}：`), kind === 'search' ? q : name || slug)
-    const key = `${curSite}/${kind}/${kind === 'search' ? q : slug}`
-    const follows = () => store.get('follows', [])
-    const on = () => follows().some((f) => f.key === key)
+    const t = { kind, slug: kind === 'search' ? q : slug, name: kind === 'search' ? q : name || slug }
+    const key = followKey(curSite, t)
     const btn = h('button', { class: 'btn small' })
-    const paint = () => (btn.textContent = on() ? '★ 已追蹤' : '☆ 追蹤')
+    const paint = () => (btn.textContent = isFollowing(key) ? '★ 已追蹤' : '☆ 追蹤')
     btn.onclick = () => {
-      const list = follows().filter((f) => f.key !== key)
-      if (!on()) list.unshift({ key, site: curSite, kind, slug: kind === 'search' ? q : slug, name: kind === 'search' ? q : name || slug })
-      store.set('follows', list)
+      toggleFollow(curSite, t)
       paint()
     }
     paint()
@@ -392,7 +574,7 @@ const pages = {
     if (!tab) return nav('home', {}, { push: false })
     const { bar, sort } = filterBar(params, { sorts: s.groupSorts(kind) })
     view.append(h('div', { class: 'page-head' }, h('h1', {}, tab.name), bar))
-    const follows = store.get('follows', []).filter((f) => (f.site || 'rv') === curSite)
+    const follows = s.followKinds ? [] : followsOf(curSite)
     if (follows.length) {
       view.append(
         h(
@@ -430,6 +612,90 @@ const pages = {
           g.count ? h('div', { class: 'meta' }, g.count) : null,
         ),
     )
+  },
+
+  // 追蹤：分「作者」「分類」兩頁，上面是追蹤清單，下面是全部合在一起的最新影片
+  follows(params) {
+    const s = siteOf(curSite)
+    if (!s.followKinds) return nav('home', {}, { push: false })
+    const tab = s.followKinds.find((k) => k.id === (params.tab || store.get('followTab'))) || s.followKinds[0]
+    const all = followsOf(curSite)
+    const mine = all.filter((f) => tab.kinds.includes(f.kind))
+    const tabs = h(
+      'div',
+      { class: 'chips' },
+      s.followKinds.map((k) =>
+        h(
+          'button',
+          {
+            class: `chip${k === tab ? ' on' : ''}`,
+            onclick: () => {
+              store.set('followTab', k.id)
+              nav('follows', { ...params, tab: k.id })
+            },
+          },
+          `${k.name}（${all.filter((f) => k.kinds.includes(f.kind)).length}）`,
+        ),
+      ),
+    )
+    const { bar, type } = filterBar(params, { sorts: [], types: s.filters.types, remember: false })
+    view.append(h('div', { class: 'page-head' }, h('h1', {}, '追蹤'), h('div', { class: 'filters' }, tabs), bar))
+    if (!mine.length) {
+      view.append(
+        h(
+          'div',
+          { class: 'status follow-empty' },
+          h('div', {}, `還沒有追蹤任何${tab.name}`),
+          h('div', { class: 'dim' }, `在影片頁的${tab.name}旁按 ☆，或在${tab.name}的影片列表按「☆ 追蹤」。`),
+          tab.browse ? h('button', { class: 'btn', onclick: () => nav('groups', { kind: tab.browse }) }, `瀏覽全部${tab.name}`) : null,
+        ),
+      )
+      return
+    }
+
+    // 追蹤清單：點名字看他的全部影片，數字是新影片，× 取消追蹤
+    const badges = new Map()
+    const chip = (f) => {
+      const n = h('span', { class: 'fnew hidden' })
+      badges.set(f.key, n)
+      const el = h(
+        'span',
+        { class: `fchip ${f.kind}` },
+        h('button', { class: 'fname', title: `看「${f.name}」的全部影片`, onclick: () => openTag(curSite, f) }, f.name, n),
+        h(
+          'button',
+          {
+            class: 'fx',
+            title: '取消追蹤',
+            onclick: () => {
+              if (!confirm(`取消追蹤「${f.name}」？`)) return
+              toggleFollow(curSite, f)
+              nav('follows', params, { push: false })
+            },
+          },
+          '×',
+        ),
+      )
+      return el
+    }
+    view.append(h('div', { class: 'follow-list' }, mine.map(chip)))
+    view.append(h('h2', { class: 'section-title' }, '最新影片', h('span', { class: 'dim' }, `　${mine.length} 個${tab.name}的影片，依上傳時間排列`)))
+
+    // 第一次讀到各列表時：比上次看到的新的標「新」，記下最新一部
+    const onFirst = (f, items) => {
+      const fresh = f.lastId ? items.filter((v) => newer(v.id, f.lastId)) : []
+      for (const v of fresh) v.isNew = true
+      const b = badges.get(f.key)
+      if (b && fresh.length) {
+        b.textContent = fresh.length >= items.length ? `${fresh.length}+` : fresh.length
+        b.classList.remove('hidden')
+      }
+      const top = items.reduce((m, v) => (newer(v.id, m) ? v.id : m), '0')
+      if (top !== '0') setLastId(f.key, top)
+      followNew.set(f.key, 0)
+      paintFollowCount()
+    }
+    infiniteGrid(view, mergedFeed(mine, type, onFirst), (v) => videoCard(v))
   },
 
   favorites() {
@@ -649,8 +915,8 @@ async function playLocal(j) {
 // ---------- 影片頁 / 播放器 ----------
 
 let videoToken = 0
-const videoStack = []
 let currentVideo = null
+let currentLocal = null
 let saveTimer = null
 
 function closeVideo() {
@@ -665,8 +931,8 @@ function closeVideo() {
   }
   player.classList.add('hidden')
   player.replaceChildren()
-  videoStack.length = 0
   currentVideo = null
+  currentLocal = null
 }
 
 function savePos() {
@@ -682,22 +948,23 @@ function pickSource(list) {
 
 /** 影片頁裡的標籤 / 作者按鈕：開該來源的列表 */
 function openTag(siteKey, t) {
-  closeVideo()
+  record()
   if (siteKey !== curSite) setSite(siteKey, { go: false })
-  if (t.kind === 'search') nav('list', { kind: 'search', q: t.slug })
-  else nav('list', { kind: t.kind, slug: t.slug, name: t.name })
+  const params = t.kind === 'search' ? { kind: 'search', q: t.slug } : { kind: t.kind, slug: t.slug, name: t.name }
+  nav('list', params, { push: false })
 }
 
+/** fromStack：返回 / 前進 / 重新載入時用，不另外記一步 */
 async function openVideo(v, { local = null, fromStack = false } = {}) {
-  if (currentVideo && !fromStack) {
-    savePos()
-    videoStack.push(currentVideo)
-  }
+  if (!fromStack) record()
+  savePos()
   clearInterval(saveTimer)
   const token = ++videoToken
   const sk = vsite(v)
   const s = siteOf(sk)
   currentVideo = brief(v)
+  currentLocal = local
+  paintNavBtns()
   player.classList.remove('hidden')
   player.scrollTop = 0
 
@@ -854,8 +1121,27 @@ async function openVideo(v, { local = null, fromStack = false } = {}) {
   } else if (sources.length) fillDlMenu(sources)
   else dlBtn.disabled = true
 
-  const chipRow = (row) =>
-    row.items.length ? h('div', { class: 'tagrow' }, h('span', { class: 'label' }, row.label), row.items.map((t) => h('button', { class: `tag ${t.kind}`, onclick: () => openTag(sk, t) }, t.name))) : null
+  const followable = (t) => (s.followKinds || []).some((k) => k.star?.includes(t.kind))
+  const tagChip = (t) => {
+    const chip = h('button', { class: `tag ${t.kind}`, onclick: () => openTag(sk, t) }, t.name)
+    if (!followable(t)) return chip
+    const key = followKey(sk, t)
+    const star = h('button', { class: 'tag-star' })
+    const group = h('span', { class: `tag-group ${t.kind}` }, chip, star)
+    const paint = () => {
+      const on = isFollowing(key)
+      star.textContent = on ? '★' : '☆'
+      star.title = on ? '取消追蹤' : '追蹤'
+      group.classList.toggle('following', on)
+    }
+    star.onclick = () => {
+      toggleFollow(sk, t)
+      paint()
+    }
+    paint()
+    return group
+  }
+  const chipRow = (row) => (row.items.length ? h('div', { class: 'tagrow' }, h('span', { class: 'label' }, row.label), row.items.map(tagChip)) : null)
 
   infoBox.replaceChildren(
     h('h1', {}, currentVideo.title),
@@ -887,6 +1173,8 @@ document.addEventListener('keydown', (e) => {
     if (!player.classList.contains('hidden')) return goBack()
   }
   if (e.altKey && e.key === 'ArrowLeft') return goBack()
+  if (e.altKey && e.key === 'ArrowRight') return goForward()
+  if (e.key === 'Backspace' && !typing) return goBack()
   if (typing || player.classList.contains('hidden')) return
   const vid = $('video.main', player)
   if (!vid) return
@@ -909,9 +1197,9 @@ document.addEventListener('keydown', (e) => {
 })
 // 滑鼠側鍵「上一頁」
 window.addEventListener('mouseup', (e) => {
-  if (e.button === 3) {
+  if (e.button === 3 || e.button === 4) {
     e.preventDefault()
-    goBack()
+    e.button === 3 ? goBack() : goForward()
   }
 })
 
@@ -1059,10 +1347,9 @@ async function checkUpdate(manual = false) {
 
 // ---------- 啟動 ----------
 
-$('.brand').onclick = () => {
-  if (!player.classList.contains('hidden')) closeVideo()
-  nav('home')
-}
+$('.brand').onclick = () => nav('home')
+$('#navBack').onclick = goBack
+$('#navFwd').onclick = goForward
 
 const verEl = $('#version')
 verEl.textContent = versionText()
@@ -1087,7 +1374,6 @@ $('#searchForm').addEventListener('submit', (e) => {
       if (m) return openVideo({ site: k, id: m.id, url: m.url, title: '' })
     }
   }
-  if (!player.classList.contains('hidden')) closeVideo()
   nav('list', { kind: 'search', q })
 })
 
@@ -1097,7 +1383,9 @@ renderSiteSwitch()
 renderTabs()
 nav('home', {}, { push: false })
 setTimeout(() => checkUpdate(), 2500)
+setTimeout(() => checkFollows(), 4000)
+setInterval(() => checkFollows(), 30 * 60 * 1000)
 showWhatsNew()
 
 // 測試用
-window.__app = { nav, openVideo, closeVideo, setSite, showChangelog, checkUpdate, jobs, SITES }
+window.__app = { nav, goBack, goForward, openVideo, closeVideo, setSite, checkFollows, showChangelog, checkUpdate, jobs, SITES }

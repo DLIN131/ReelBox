@@ -33,9 +33,12 @@ export const filters = {
   ],
 }
 
-export const groupTabs = [
-  { kind: 'categories', name: '分類' },
-  { kind: 'models', name: '作者' },
+export const groupTabs = [{ kind: 'categories', name: '分類' }]
+
+// 「追蹤」分頁的兩頁：kinds = 歸在這頁的追蹤種類（舊版追蹤過的標籤 / 搜尋也放分類）；star = 影片頁哪種標籤旁有 ☆
+export const followKinds = [
+  { id: 'models', name: '作者', kinds: ['models'], star: ['models'] },
+  { id: 'categories', name: '分類', kinds: ['categories', 'tags', 'search'], star: ['categories'], browse: 'categories' },
 ]
 
 export function groupSorts(kind) {
