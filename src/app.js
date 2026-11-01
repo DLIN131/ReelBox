@@ -711,11 +711,16 @@ async function openVideo(v, { local = null, fromStack = false } = {}) {
   player.replaceChildren(h('div', { class: 'vp' }, h('div', { class: 'vp-top' }, back, siteBadge(sk), qBox), stage, infoBox, listBox, relBox))
 
   let sources = []
-  const setSource = (src) => {
+  let direct = false // 本機轉送失敗過就改成直接連 CDN
+  const setSource = async (src) => {
     const t = vid.currentTime
     const playing = !vid.paused
-    vid.src = src.url
     for (const b of qBox.querySelectorAll('button')) b.classList.toggle('on', b.dataset.url === src.url)
+    // 線上播放走本機轉送：多條連線同時抓，限速的伺服器也不會一直卡
+    const url = local || direct ? src.url : await window.hub.stream(sk, src.url).catch(() => src.url)
+    if (token !== videoToken) return
+    vid.dataset.orig = src.url
+    vid.src = url
     if (t) vid.currentTime = t
     if (playing || store.get('autoplay', true)) vid.play().catch(() => {})
   }
@@ -753,6 +758,11 @@ async function openVideo(v, { local = null, fromStack = false } = {}) {
   vid.addEventListener('pause', savePos)
   vid.addEventListener('error', () => {
     if (token !== videoToken || !vid.getAttribute('src')) return
+    if (!direct && !local && vid.src.startsWith('http://127.0.0.1')) {
+      direct = true
+      const cur = sources.find((x) => x.url === vid.dataset.orig)
+      if (cur) return setSource(cur)
+    }
     stage.querySelector('.verr')?.remove()
     stage.append(h('div', { class: 'verr' }, '播放失敗（網址可能過期）', h('button', { class: 'btn', onclick: () => openVideo(v, { local, fromStack: true }) }, '重新載入')))
   })

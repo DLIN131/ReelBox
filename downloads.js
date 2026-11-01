@@ -1,13 +1,12 @@
 // 影片下載佇列（主程序）：可暫停 / 續傳，關掉程式再開會從上次的位置繼續。
 // 檔案切成小段，從所有找得到的 CDN 主機同時下載（見 mirrors.js），寫進 .part 的對應位置。
-const { app, ipcMain, dialog, shell, session, BrowserWindow } = require('electron')
+const { app, ipcMain, dialog, shell, BrowserWindow } = require('electron')
 const fs = require('original-fs')
 const path = require('path')
-const http = require('http')
-const https = require('https')
 const { pathToFileURL } = require('url')
 const fetcher = require('./fetcher')
 const mirrors = require('./mirrors')
+const { nodeGet, chromiumGet } = require('./httpget')
 
 const MAX_RUNNING = 2
 const jobsFile = () => path.join(app.getPath('userData'), 'downloads.json')
@@ -88,44 +87,9 @@ function pump() {
   }
 }
 
-// rv 站的 CDN 每「條連線」限速約 0.24 MB/s，開多條就能疊加（16 條約 3.8 MB/s）。
-// Chromium（session.fetch）對同一台主機會把所有請求併進一條 HTTP/2 連線，開再多也只有一條的速度，
-// 所以分段改用 Node 的 https（HTTP/1.1，每條連線各自一個 socket）；它連不上（例如要走系統代理）才退回 session.fetch。
+// 分段大小和連線數；為什麼要用多條連線見 httpget.js
 const CHUNK = 2 * 1048576 // 分段大小；最後幾段也不會拖太久
 const TOTAL_CONN = 16 // 每個下載總共開幾條連線，平均分給各台主機
-const agent = new https.Agent({ keepAlive: true, maxSockets: Infinity })
-const nodeLib = (u) => (u.startsWith('https:') ? https : http)
-
-/** 用 Node 抓一段，回傳 { status, stream } */
-function nodeGet(url, headers, signal) {
-  return new Promise((resolve, reject) => {
-    const req = nodeLib(url).get(url, { agent: url.startsWith('https:') ? agent : undefined, headers: { 'User-Agent': app.userAgentFallback, ...headers } }, (res) => resolve({ status: res.statusCode, stream: res }))
-    const onAbort = () => req.destroy(new Error('aborted'))
-    signal.addEventListener('abort', onAbort, { once: true })
-    req.on('close', () => signal.removeEventListener('abort', onAbort))
-    req.on('error', reject)
-    req.setTimeout(30000, () => req.destroy(new Error('連線逾時')))
-  })
-}
-
-/** 用 Chromium 抓一段（備用），包成跟 nodeGet 一樣的介面 */
-async function chromiumGet(url, headers, signal) {
-  const res = await session.defaultSession.fetch(url, { headers, signal })
-  const reader = res.body.getReader()
-  return {
-    status: res.status,
-    stream: {
-      async *[Symbol.asyncIterator]() {
-        for (;;) {
-          const { done, value } = await reader.read()
-          if (done) return
-          yield Buffer.from(value)
-        }
-      },
-      destroy: () => reader.cancel().catch(() => {}),
-    },
-  }
-}
 
 async function run(j) {
   const ctl = new AbortController()

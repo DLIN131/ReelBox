@@ -27,7 +27,11 @@ function resolveRedirect(url, referer) {
       finish(to)
       rq.abort()
     })
-    rq.on('response', () => finish(url))
+    // 沒有轉址（例如直接就是檔案）：拿到回應就斷掉，不要把整個檔案抓下來
+    rq.on('response', () => {
+      finish(url)
+      rq.abort()
+    })
     rq.on('error', () => finish(url))
     rq.end()
   })
@@ -92,4 +96,4 @@ async function find(url, referer) {
   return { urls: [first, ...hosts.map(swap)], total }
 }
 
-module.exports = { find, resolveRedirect }
+module.exports = { find, resolveRedirect, probe }

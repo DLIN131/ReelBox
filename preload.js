@@ -20,6 +20,8 @@ contextBridge.exposeInMainWorld('hub', {
   get: (site, url) => ipcRenderer.invoke('net:get', site, url),
   sources: (site, url) => ipcRenderer.invoke('net:sources', site, url),
   sizes: (site, urls) => ipcRenderer.invoke('net:sizes', site, urls),
+  // 線上播放走本機轉送（多條連線），回傳 http://127.0.0.1 的網址
+  stream: (site, url) => ipcRenderer.invoke('net:stream', site, url),
   config: () => ipcRenderer.invoke('site:config'),
   setBase: (site, b) => ipcRenderer.invoke('site:setBase', site, b),
   external: (url) => ipcRenderer.invoke('shell:external', url),
