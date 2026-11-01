@@ -289,9 +289,12 @@ window.hub.dl.list().then((list) => {
   updateDlCount()
 })
 
+/** 影片的作者（影片資訊「作者」那列的第一個）；下載時拿來分資料夾 */
+const authorOf = (info) => info?.rows?.find((r) => r.label === '作者')?.items[0]?.name || ''
+
 async function startDownload(v, src) {
   try {
-    const j = await window.hub.dl.add({ site: vsite(v), videoId: v.id, pageUrl: v.url, title: v.title, thumb: v.thumb, duration: v.duration, height: src.height, label: src.label })
+    const j = await window.hub.dl.add({ site: vsite(v), videoId: v.id, pageUrl: v.url, title: v.title, author: v.author || '', thumb: v.thumb, duration: v.duration, height: src.height, label: src.label })
     jobs.set(j.id, j)
     updateDlCount()
     toast(j.status === 'done' ? '這個畫質已經下載過了' : `已加入下載：${src.label}`)
@@ -760,6 +763,7 @@ const pages = {
           dirEl,
           h('button', { class: 'btn small', onclick: () => window.hub.dl.openDir() }, '開啟資料夾'),
           h('button', { class: 'btn small', onclick: async () => (dirEl.textContent = await window.hub.dl.chooseDir()) }, '變更位置'),
+          h('button', { class: 'btn small', title: '把下載過的影片依作者搬到各自的資料夾', onclick: (e) => organizeDownloads(e.currentTarget) }, '依作者整理'),
         ),
       ),
     )
@@ -841,7 +845,17 @@ const pages = {
     // 下載
     const dirEl = h('span', { class: 'path' })
     window.hub.dl.dir().then((d) => (dirEl.textContent = d))
-    box.append(section('下載', h('div', { class: 'row' }, '下載位置：', dirEl, h('button', { class: 'btn small', onclick: async () => (dirEl.textContent = await window.hub.dl.chooseDir()) }, '變更'))))
+    const byAuthor = h('input', { type: 'checkbox', checked: true })
+    window.hub.dl.options().then((o) => (byAuthor.checked = o.byAuthor))
+    byAuthor.onchange = () => window.hub.dl.setOptions({ byAuthor: byAuthor.checked })
+    box.append(
+      section(
+        '下載',
+        h('div', { class: 'row' }, '下載位置：', dirEl, h('button', { class: 'btn small', onclick: async () => (dirEl.textContent = await window.hub.dl.chooseDir()) }, '變更')),
+        h('label', { class: 'check' }, byAuthor, '依作者分資料夾存放（下載位置\作者名\影片.mp4，沒有作者的放「未知作者」）'),
+        h('div', { class: 'row' }, h('button', { class: 'btn small', onclick: (e) => organizeDownloads(e.currentTarget) }, '依作者整理已下載的影片'), h('span', { class: 'dim' }, '舊的下載也搬進作者資料夾')),
+      ),
+    )
 
     // 各來源網址
     const rows = SITE_KEYS.map((k) => {
@@ -893,7 +907,7 @@ function dlRow(j) {
         paused: `已暫停 ${size ? `· ${size}` : ''}`,
         done: `完成 · ${fmtBytes(j.total)}`,
         error: `失敗：${j.error}`,
-      }[j.status] + ` · ${j.label || ''}`
+      }[j.status] + ` · ${j.label || ''}${j.author ? ` · ${j.author}` : ''}`
     const del = btn('移除', async () => {
       const file = j.status === 'done' && confirm('要一併把影片檔丟到資源回收筒嗎？\n（按「取消」只從列表移除，檔案保留）')
       await window.hub.dl.remove(j.id, file)
@@ -905,6 +919,42 @@ function dlRow(j) {
   }
   update(j)
   return { el, update }
+}
+
+/** 把下載過的影片依作者搬進資料夾；舊的下載沒記作者，先去影片頁讀 */
+async function organizeDownloads(btn) {
+  if (!(await window.hub.dl.options()).byAuthor) return toast('請先在「設定 → 下載」開啟「依作者分資料夾存放」')
+  const list = [...jobs.values()].filter((j) => j.file && j.status !== 'running')
+  if (!list.length) return toast('沒有可以整理的下載')
+  if (!confirm(`把 ${list.length} 部下載過的影片依作者搬到各自的資料夾？`)) return
+  const text = btn.textContent
+  btn.disabled = true
+  const need = list.filter((j) => !j.author)
+  let n = 0
+  const limit = limiter(3)
+  try {
+    const found = await Promise.all(
+      need.map((j) =>
+        limit(async () => {
+          try {
+            return { id: j.id, author: authorOf(await siteOf(vsite(j)).video(j.pageUrl)) }
+          } catch {
+            return null // 讀不到就先不搬
+          } finally {
+            btn.textContent = `讀取作者 ${++n} / ${need.length}`
+          }
+        }),
+      ),
+    )
+    const items = [...list.filter((j) => j.author).map((j) => ({ id: j.id, author: j.author })), ...found.filter(Boolean)]
+    btn.textContent = '搬移中…'
+    const r = await window.hub.dl.organize(items)
+    const skipped = found.filter((x) => !x).length
+    toast(r.moved ? `已整理 ${r.moved} 部影片${r.failed ? `，${r.failed} 部搬不動（可能正在播放）` : ''}${skipped ? `，${skipped} 部讀不到作者` : ''}` : '都已經在作者資料夾裡了')
+  } finally {
+    btn.disabled = false
+    btn.textContent = text
+  }
 }
 
 async function playLocal(j) {
@@ -1097,7 +1147,7 @@ async function openVideo(v, { local = null, fromStack = false } = {}) {
           {
             onclick: () => {
               dlMenu.classList.add('hidden')
-              startDownload(currentVideo, x)
+              startDownload({ ...currentVideo, author: authorOf(info) }, x)
             },
           },
           h('b', {}, x.label),

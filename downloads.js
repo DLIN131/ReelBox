@@ -12,6 +12,7 @@ const MAX_RUNNING = 2
 const jobsFile = () => path.join(app.getPath('userData'), 'downloads.json')
 let jobs = []
 let dir = ''
+let byAuthor = true // 依作者分資料夾
 const running = new Map() // job.id → AbortController
 let saveTimer = null
 const sendTimers = new Map()
@@ -21,6 +22,7 @@ function load() {
     const d = JSON.parse(fs.readFileSync(jobsFile(), 'utf8'))
     jobs = Array.isArray(d.jobs) ? d.jobs : []
     dir = d.dir || ''
+    if (typeof d.byAuthor === 'boolean') byAuthor = d.byAuthor
   } catch {}
   if (!dir) dir = path.join(app.getPath('downloads'), 'ReelBox')
   for (const j of jobs) {
@@ -41,7 +43,7 @@ function flush() {
   clearTimeout(saveTimer)
   try {
     const f = jobsFile()
-    fs.writeFileSync(f + '.tmp', JSON.stringify({ dir, jobs }))
+    fs.writeFileSync(f + '.tmp', JSON.stringify({ dir, byAuthor, jobs }))
     fs.renameSync(f + '.tmp', f)
   } catch {}
 }
@@ -70,14 +72,65 @@ const clean = (s) =>
     .replace(/[. ]+$/, '')
     .slice(0, 120) || 'video'
 
+/** 放哪個資料夾：開了「依作者分資料夾」就是 下載位置\作者名 */
+const folderOf = (j) => (byAuthor ? path.join(dir, clean(j.author || '未知作者')) : dir)
+
 /** 檔名：標題 [編號] 畫質.mp4；同名檔案已存在（又不是這個工作的）就加 (2)、(3)… */
-function pickFile(j) {
-  fs.mkdirSync(dir, { recursive: true })
+function pickFile(j, folder = folderOf(j)) {
+  fs.mkdirSync(folder, { recursive: true })
   const stem = `${clean(j.title)} [${j.videoId}] ${j.label}`
   for (let n = 1; ; n++) {
-    const f = path.join(dir, `${stem}${n > 1 ? ` (${n})` : ''}.mp4`)
+    const f = path.join(folder, `${stem}${n > 1 ? ` (${n})` : ''}.mp4`)
+    if (f === j.file) return f
     if (!fs.existsSync(f) && !fs.existsSync(f + '.part') && !jobs.some((o) => o !== j && o.file === f)) return f
   }
+}
+
+/** 搬檔案；不同磁碟不能直接改名，就複製再刪 */
+function moveFile(from, to) {
+  try {
+    fs.renameSync(from, to)
+  } catch (e) {
+    if (e.code !== 'EXDEV') throw e
+    fs.copyFileSync(from, to)
+    fs.rmSync(from)
+  }
+}
+
+/** 把下載過的影片搬到對應的作者資料夾；list = [{ id, author }]（author 空的就用工作上記的） */
+function organize(list) {
+  let moved = 0
+  let failed = 0
+  for (const { id, author } of list) {
+    const j = jobs.find((x) => x.id === id)
+    if (!j) continue
+    if (author) j.author = author
+    // 還沒開始的不用搬，開始下載時就會放對地方；下載中的等下次
+    if (!j.file || running.has(j.id)) continue
+    const target = folderOf(j)
+    if (path.dirname(j.file) === target) continue
+    const src = j.status === 'done' ? j.file : j.file + '.part'
+    if (!fs.existsSync(src)) continue
+    try {
+      const old = j.file
+      const f = pickFile(j, target)
+      moveFile(src, j.status === 'done' ? f : f + '.part')
+      j.file = f
+      moved++
+      // 舊資料夾搬空了就順手刪掉（只刪下載位置裡面的空資料夾）
+      const od = path.dirname(old)
+      if (od !== dir && od.startsWith(dir + path.sep)) {
+        try {
+          fs.rmdirSync(od)
+        } catch {}
+      }
+    } catch {
+      failed++
+    }
+    emit(j, true)
+  }
+  save()
+  return { moved, failed }
 }
 
 function pump() {
@@ -243,6 +296,13 @@ function setup() {
   load()
   ipcMain.handle('dl:list', () => jobs.map(publicJob))
   ipcMain.handle('dl:dir', () => dir)
+  ipcMain.handle('dl:options', () => ({ byAuthor }))
+  ipcMain.handle('dl:setOptions', (_e, o) => {
+    if (typeof o.byAuthor === 'boolean') byAuthor = o.byAuthor
+    save()
+    return { byAuthor }
+  })
+  ipcMain.handle('dl:organize', (_e, list) => organize(list))
   ipcMain.handle('dl:chooseDir', async (e) => {
     const r = await dialog.showOpenDialog(BrowserWindow.fromWebContents(e.sender), { defaultPath: dir, properties: ['openDirectory', 'createDirectory'] })
     if (!r.canceled && r.filePaths[0]) {
@@ -266,6 +326,7 @@ function setup() {
       videoId: String(v.videoId),
       pageUrl: v.pageUrl,
       title: v.title || '',
+      author: v.author || '',
       thumb: v.thumb || '',
       duration: v.duration || '',
       height: v.height || 0,

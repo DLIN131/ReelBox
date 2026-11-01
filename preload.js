@@ -28,6 +28,9 @@ contextBridge.exposeInMainWorld('hub', {
   dl: {
     list: () => ipcRenderer.invoke('dl:list'),
     dir: () => ipcRenderer.invoke('dl:dir'),
+    options: () => ipcRenderer.invoke('dl:options'),
+    setOptions: (o) => ipcRenderer.invoke('dl:setOptions', o),
+    organize: (list) => ipcRenderer.invoke('dl:organize', list),
     chooseDir: () => ipcRenderer.invoke('dl:chooseDir'),
     openDir: () => ipcRenderer.invoke('dl:openDir'),
     add: (v) => ipcRenderer.invoke('dl:add', v),

@@ -12,5 +12,6 @@
   "devDependencies": {
     "@electron/packager": "18.4.4",
     "electron": "33.4.11"
-  }
+  },
+  "license": "SEE LICENSE IN LICENSE"
 }
